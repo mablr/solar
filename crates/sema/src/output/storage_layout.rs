@@ -61,36 +61,54 @@ pub type StorageLayoutMember = StorageLayoutEntry;
 impl<'gcx> Gcx<'gcx> {
     /// Returns the storage layout for the given contract.
     pub fn storage_layout(self, contract_id: hir::ContractId) -> StorageLayoutOutput {
-        StorageLayoutBuilder::new(self, contract_id, DataLocation::Storage).build()
+        StorageLayoutBuilder::new(
+            self,
+            self.contract_fully_qualified_name(contract_id).to_string(),
+            DataLocation::Storage,
+        )
+        .build_contract(contract_id)
     }
 
     /// Returns the transient storage layout for the given contract.
     pub fn transient_storage_layout(self, contract_id: hir::ContractId) -> StorageLayoutOutput {
-        StorageLayoutBuilder::new(self, contract_id, DataLocation::Transient).build()
+        StorageLayoutBuilder::new(
+            self,
+            self.contract_fully_qualified_name(contract_id).to_string(),
+            DataLocation::Transient,
+        )
+        .build_contract(contract_id)
+    }
+
+    /// Returns the storage layout for a struct rooted at `base_slot`.
+    pub fn storage_layout_for_struct(
+        self,
+        struct_id: hir::StructId,
+        base_slot: U256,
+    ) -> StorageLayoutOutput {
+        let strukt = self.hir.strukt(struct_id);
+        let contract_name = strukt.contract.map_or_else(
+            || format!("{}:{}", self.hir.source(strukt.source).file.name.display(), strukt.name),
+            |contract_id| self.contract_fully_qualified_name(contract_id).to_string(),
+        );
+        StorageLayoutBuilder::new(self, contract_name, DataLocation::Storage)
+            .build_fields(strukt.fields, base_slot)
     }
 }
 
 struct StorageLayoutBuilder<'gcx> {
     gcx: Gcx<'gcx>,
-    contract_id: hir::ContractId,
     contract_name: String,
     location: DataLocation,
     types: FxIndexMap<String, StorageLayoutType>,
 }
 
 impl<'gcx> StorageLayoutBuilder<'gcx> {
-    fn new(gcx: Gcx<'gcx>, contract_id: hir::ContractId, location: DataLocation) -> Self {
-        Self {
-            gcx,
-            contract_id,
-            contract_name: gcx.contract_fully_qualified_name(contract_id).to_string(),
-            location,
-            types: FxIndexMap::default(),
-        }
+    fn new(gcx: Gcx<'gcx>, contract_name: String, location: DataLocation) -> Self {
+        Self { gcx, contract_name, location, types: FxIndexMap::default() }
     }
 
-    fn build(mut self) -> StorageLayoutOutput {
-        let contract = self.gcx.hir.contract(self.contract_id);
+    fn build_contract(mut self, contract_id: hir::ContractId) -> StorageLayoutOutput {
+        let contract = self.gcx.hir.contract(contract_id);
         let base_slot = match self.location {
             DataLocation::Storage => contract.layout.map_or(U256::ZERO, |layout| {
                 self.gcx
@@ -103,7 +121,7 @@ impl<'gcx> StorageLayoutBuilder<'gcx> {
             DataLocation::Memory | DataLocation::Calldata => unreachable!(),
         };
         let bases = if contract.linearized_bases.is_empty() {
-            std::slice::from_ref(&self.contract_id)
+            std::slice::from_ref(&contract_id)
         } else {
             contract.linearized_bases
         }
@@ -132,6 +150,19 @@ impl<'gcx> StorageLayoutBuilder<'gcx> {
             }
         }
 
+        let types = (!self.types.is_empty()).then_some(self.types);
+        StorageLayoutOutput { storage, types }
+    }
+
+    fn build_fields(mut self, fields: &[hir::VariableId], base_slot: U256) -> StorageLayoutOutput {
+        let mut cursor = StorageCursor::new(base_slot);
+        let mut storage = Vec::with_capacity(fields.len());
+        for &field in fields {
+            let ty = self.gcx.type_of_item(field.into());
+            let ty_name = self.generate_type(ty);
+            let (slot, offset) = self.place_type(ty, &mut cursor);
+            storage.push(self.storage_entry(field, slot, offset, ty_name));
+        }
         let types = (!self.types.is_empty()).then_some(self.types);
         StorageLayoutOutput { storage, types }
     }
@@ -446,4 +477,80 @@ impl StorageCursor {
 
 fn slots_for(bytes: U256) -> U256 {
     bytes / U256::from(32) + U256::from(u8::from(bytes % U256::from(32) != U256::ZERO))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Compiler;
+    use solar_interface::{Session, config::CompileOpts};
+    use std::{ops::ControlFlow, path::PathBuf};
+
+    #[test]
+    fn lays_out_struct_from_arbitrary_root() {
+        let sess = Session::builder().opts(CompileOpts::default()).with_test_emitter().build();
+        let mut compiler = Compiler::new(sess);
+        compiler.enter_mut(|compiler| {
+            let mut parser = compiler.parse();
+            let file = compiler
+                .sess()
+                .source_map()
+                .new_source_file(
+                    PathBuf::from("test.sol"),
+                    r#"
+                    contract Container {
+                        struct Data {
+                            address owner;
+                            bool paused;
+                            uint256[2] values;
+                            mapping(uint256 => address) accounts;
+                        }
+                    }
+                    "#,
+                )
+                .unwrap();
+            parser.add_file(file);
+            parser.parse();
+            assert_eq!(compiler.lower_asts(), Ok(ControlFlow::Continue(())));
+            assert_eq!(compiler.analysis(), Ok(ControlFlow::Continue(())));
+        });
+        assert!(compiler.sess().dcx.has_errors().is_ok());
+
+        let base_slot = U256::from(0x1000);
+        let layout = compiler.enter(|compiler| {
+            let gcx = compiler.gcx();
+            let contract_id = gcx
+                .hir
+                .contract_ids()
+                .find(|&id| gcx.hir.contract(id).name.as_str() == "Container")
+                .unwrap();
+            let struct_id = gcx
+                .hir
+                .contract(contract_id)
+                .items
+                .iter()
+                .find_map(hir::ItemId::as_struct)
+                .unwrap();
+            gcx.storage_layout_for_struct(struct_id, base_slot)
+        });
+
+        assert_eq!(layout.storage.len(), 4);
+        assert_eq!(layout.storage[0].contract, "test.sol:Container");
+        assert_eq!(layout.storage[0].label, "owner");
+        assert_eq!(layout.storage[0].slot, base_slot.to_string());
+        assert_eq!(layout.storage[1].label, "paused");
+        assert_eq!(layout.storage[1].slot, base_slot.to_string());
+        assert_eq!(layout.storage[1].offset, 20);
+        assert_eq!(layout.storage[2].slot, (base_slot + U256::from(1)).to_string());
+        assert_eq!(layout.storage[3].slot, (base_slot + U256::from(3)).to_string());
+
+        let types = layout.types.as_ref().unwrap();
+        let values = types.get(&layout.storage[2].r#type).unwrap();
+        assert_eq!(values.number_of_bytes, "64");
+        assert!(values.base.is_some());
+        let accounts = types.get(&layout.storage[3].r#type).unwrap();
+        assert!(matches!(accounts.encoding, StorageEncoding::Mapping));
+        assert!(accounts.key.is_some());
+        assert!(accounts.value.is_some());
+    }
 }
